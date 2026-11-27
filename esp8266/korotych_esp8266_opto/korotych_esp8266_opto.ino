@@ -304,6 +304,7 @@ void onSaveConfigCallback() {
 }
 
 void runConfigPortal(bool forcePortal) {
+  String customHead = FPSTR(CUSTOM_CSS);
   WiFiManager wm;
   g_shouldSaveConfig = false;
 
@@ -311,7 +312,7 @@ void runConfigPortal(bool forcePortal) {
   wm.setConfigPortalTimeout(PORTAL_TIMEOUT_SEC);
   wm.setConnectTimeout(25);
   wm.setTitle("⚡ Пеленгатор света · Коротич");
-  wm.setCustomHeadElement(FPSTR(CUSTOM_CSS));
+  wm.setCustomHeadElement(customHead.c_str());
 
   String headerHtml = String(F("<div class='hint'>ID датчика: <b>")) + g_sensorId +
                       F("</b> · Прошивка: <b>v") + FW_VERSION + F("</b></div>");
@@ -475,7 +476,9 @@ void notifyPersonalBoot(bool online) {
   msg += F("📍 Точка: <b>") + label + F("</b> (<code>") + g_sensorId + F("</code>)\n");
   msg += F("⚡ Сеть 220 В: <b>") + String(online ? "ЕСТЬ" : "НЕТ") + F("</b>\n");
   msg += F("📶 Wi-Fi RSSI: ") + String(WiFi.RSSI()) + F(" dBm\n");
-  msg += F("📦 Прошивка: <code>v") + FW_VERSION + F("</code>");
+  msg += F("📦 Прошивка: <code>v");
+  msg += FW_VERSION;
+  msg += F("</code>");
 
   sendTelegramMessage(msg);
 }
@@ -560,7 +563,11 @@ void checkAndApplyOta() {
     String label = strlen(g_cfg.sensor_label) > 0 ? escapeHtml(g_cfg.sensor_label) : String(g_sensorId);
     String msg = F("🔄 <b>Обновление прошивки (OTA)</b>\n");
     msg += F("📍 Точка: <b>") + label + F("</b>\n");
-    msg += F("📦 Версия: <code>v") + FW_VERSION + F("</code> → <code>v") + escapeHtml(remoteVer) + F("</code>");
+    msg += F("📦 Версия: <code>v");
+    msg += FW_VERSION;
+    msg += F("</code> → <code>v");
+    msg += escapeHtml(remoteVer);
+    msg += F("</code>");
     sendTelegramMessage(msg);
   }
 
