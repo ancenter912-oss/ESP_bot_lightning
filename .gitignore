@@ -1,0 +1,19 @@
+# Local secrets & environment
+secrets.h
+esp8266/korotych_esp8266_opto/secrets.h
+.env
+.env.*
+
+# Build artifacts (keep release OTA firmware.bin tracked when published)
+build/
+.pio/
+*.elf
+*.map
+*.bin
+!esp8266/firmware.bin
+
+# IDE & OS
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
