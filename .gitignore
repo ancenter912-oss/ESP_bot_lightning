@@ -4,6 +4,7 @@ esp8266/korotych_esp8266_opto/secrets.h
 .env
 .env.*
 .agents/
+logs/
 
 # Build artifacts (keep release OTA firmware.bin tracked when published)
 build/

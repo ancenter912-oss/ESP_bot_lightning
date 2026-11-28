@@ -2,6 +2,7 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
 #include <ESP8266httpUpdate.h>
+#include <ESP8266WebServer.h>
 #include <WiFiClientSecureBearSSL.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
@@ -16,7 +17,7 @@
 // ============================================================================
 // Firmware & Backend Constants (updated via OTA, hidden from end-user UI)
 // ============================================================================
-static const char* FW_VERSION = "1.0.1";
+static const char* FW_VERSION = "1.0.2";
 static const char* VILLAGE_URL = "https://korotych-power-bot.onrender.com/api/meter";
 static const char* SENSOR_SOURCE = "ESP8266-Opto";
 
@@ -33,26 +34,29 @@ static const uint8_t PIN_LED = LED_BUILTIN;  // D4 / GPIO2 on D1 Mini / NodeMCU
 static const uint8_t LED_ACTIVE_LEVEL = LOW;
 
 // ============================================================================
-// Timing & Watchdog Constants
+// Timing, Watchdog & Diagnostics Constants
 // ============================================================================
-static const uint32_t SAMPLE_WINDOW_MS = 60;             // 3 periods of 50 Hz
-static const uint16_t OPTO_MIN_ACTIVE_SAMPLES = 3;       // noise rejection threshold
-static const uint32_t DEBOUNCE_MS = 3000;                // 3 sec status confirmation
-static const uint32_t RESET_HOLD_MS = 5000;              // 5 sec hold to open config portal
-static const uint32_t PORTAL_TIMEOUT_SEC = 300;          // 5 min portal timeout
+static const uint32_t SAMPLE_WINDOW_MS = 60;               // 3 periods of 50 Hz
+static const uint16_t OPTO_MIN_ACTIVE_SAMPLES = 3;         // noise rejection threshold
+static const uint32_t DEBOUNCE_MS = 3000;                  // 3 sec status confirmation
+static const uint32_t RESET_HOLD_MS = 5000;                // 5 sec hold to open config portal
+static const uint32_t PORTAL_TIMEOUT_SEC = 300;            // 5 min portal timeout
 
-static const uint32_t HEARTBEAT_MS = 90000;              // 90 sec village heartbeat (6x margin under 600s)
-static const uint32_t RETRY_SEND_MS = 15000;             // 15 sec retry on network error
-static const uint32_t HTTP_TIMEOUT_MS = 10000;           // 10 sec HTTP timeout
+static const uint32_t HEARTBEAT_MS = 90000;                // 90 sec village heartbeat (6x margin under 600s)
+static const uint32_t RETRY_SEND_MS = 15000;               // 15 sec retry on network error
+static const uint32_t HTTP_TIMEOUT_MS = 10000;             // 10 sec HTTP timeout
 
-static const uint32_t MIN_FREE_HEAP_BYTES = 12000;       // Software WDT heap floor (12 KB)
-static const uint32_t MIN_OTA_FREE_HEAP_BYTES = 20000;   // Minimum heap before starting OTA TLS
+static const uint32_t MIN_FREE_HEAP_BYTES = 12000;         // Software WDT heap floor (12 KB)
+static const uint32_t MIN_OTA_FREE_HEAP_BYTES = 20000;     // Minimum heap before starting OTA TLS
 static const uint32_t VILLAGE_STALE_RESTART_MS = 600000UL; // 10 min without village OK while WiFi up
 
-static const uint32_t OTA_INITIAL_DELAY_MS = 60000;      // 60 sec after boot
-static const uint32_t OTA_INTERVAL_MS = 21600000UL;      // 6 hours
+static const uint32_t OTA_INITIAL_DELAY_MS = 60000;        // 60 sec after boot
+static const uint32_t OTA_INTERVAL_MS = 21600000UL;        // 6 hours
 
 static const char* CONFIG_PATH = "/config.json";
+static const char* DIAG_LOG_PATH = "/diag.log";
+static const char* DIAG_PREV_PATH = "/diag.prev.log";
+static const size_t DIAG_LOG_MAX_BYTES = 24576;            // 24 KB x 2 rotating files in 1 MB LittleFS
 static const char* AP_NAME = "Korotych-Light-Setup";
 
 // ============================================================================
@@ -163,12 +167,19 @@ struct UserConfig {
 UserConfig g_cfg;
 char g_sensorId[16] = "";
 bool g_shouldSaveConfig = false;
+bool g_fsMounted = false;
 
-// Single reusable BearSSL client (prevents heap churn across HTTPS requests)
+// Single reusable BearSSL client & lightweight diagnostic HTTP server
 BearSSL::WiFiClientSecure g_tlsClient;
+ESP8266WebServer g_diagServer(80);
+bool g_diagServerRunning = false;
+
+// Wi-Fi event handlers (must remain global to stay subscribed)
+WiFiEventHandler g_wifiDiscHandler;
+WiFiEventHandler g_wifiGotIpHandler;
 
 // ============================================================================
-// Runtime State
+// Runtime & Diagnostics State
 // ============================================================================
 bool g_mainsState = false;
 bool g_candidateState = false;
@@ -186,8 +197,30 @@ uint32_t g_lastOtaCheckMs = 0;
 bool g_resetHolding = false;
 uint32_t g_resetHoldStartMs = 0;
 
+// Telemetry counters & last error details
+char g_bootResetReason[40] = "";
+char g_bootResetInfo[128] = "";
+int g_lastVillageHttpCode = 0;
+char g_lastVillageSslErr[64] = "";
+uint32_t g_villageOkCount = 0;
+uint32_t g_villageFailCount = 0;
+
+int g_lastTgHttpCode = 0;
+char g_lastTgSslErr[64] = "";
+uint32_t g_tgOkCount = 0;
+uint32_t g_tgFailCount = 0;
+
+uint32_t g_minFreeHeapSeen = 0xFFFFFFFFUL;
+uint32_t g_minMaxBlockSeen = 0xFFFFFFFFUL;
+uint8_t g_maxFragSeen = 0;
+
+volatile bool g_wifiDiscPending = false;
+volatile uint8_t g_lastWifiDiscReason = 0;
+volatile uint32_t g_wifiDiscCount = 0;
+volatile bool g_wifiGotIpPending = false;
+
 // ============================================================================
-// Helpers
+// Helpers & Persistent Diagnostic Logger (LittleFS rotating /diag.log)
 // ============================================================================
 void setLed(bool on) {
   digitalWrite(PIN_LED, on ? LED_ACTIVE_LEVEL : !LED_ACTIVE_LEVEL);
@@ -204,10 +237,72 @@ void blinkLed(uint8_t count, uint16_t onMs, uint16_t offMs) {
   setLed(g_mainsState);
 }
 
+void updateHeapStats() {
+  uint32_t h = ESP.getFreeHeap();
+  uint32_t b = ESP.getMaxFreeBlockSize();
+  uint8_t f = ESP.getHeapFragmentation();
+  if (h < g_minFreeHeapSeen) g_minFreeHeapSeen = h;
+  if (b < g_minMaxBlockSeen) g_minMaxBlockSeen = b;
+  if (f > g_maxFragSeen) g_maxFragSeen = f;
+}
+
+void diagLog(const char* tag, const char* fmt, ...) {
+  updateHeapStats();
+
+  char msg[160];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(msg, sizeof(msg), fmt, args);
+  va_end(args);
+
+  char line[240];
+  uint32_t upSec = millis() / 1000UL;
+  snprintf(line, sizeof(line),
+           "[%lu][%s] %s | h=%u b=%u f=%u%% rssi=%d\n",
+           static_cast<unsigned long>(upSec),
+           tag,
+           msg,
+           ESP.getFreeHeap(),
+           ESP.getMaxFreeBlockSize(),
+           ESP.getHeapFragmentation(),
+           (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0);
+
+  Serial.print(line);
+
+  if (!g_fsMounted) return;
+
+  if (LittleFS.exists(DIAG_LOG_PATH)) {
+    File check = LittleFS.open(DIAG_LOG_PATH, "r");
+    size_t sz = check ? check.size() : 0;
+    if (check) check.close();
+    if (sz >= DIAG_LOG_MAX_BYTES) {
+      if (LittleFS.exists(DIAG_PREV_PATH)) {
+        LittleFS.remove(DIAG_PREV_PATH);
+      }
+      LittleFS.rename(DIAG_LOG_PATH, DIAG_PREV_PATH);
+    }
+  }
+
+  File f = LittleFS.open(DIAG_LOG_PATH, "a");
+  if (f) {
+    f.print(line);
+    f.close();
+  }
+}
+
 void prepareTlsClient(uint16_t rxBuf, uint16_t txBuf) {
   g_tlsClient.stop();
   g_tlsClient.setInsecure();
   g_tlsClient.setBufferSizes(rxBuf, txBuf);
+}
+
+void captureTlsError(char* dst, size_t dstSize) {
+  if (!dst || dstSize == 0) return;
+  dst[0] = '\0';
+  int sslCode = g_tlsClient.getLastSSLError(dst, dstSize);
+  if (sslCode == 0) {
+    dst[0] = '\0';
+  }
 }
 
 void releaseTlsClient() {
@@ -273,6 +368,198 @@ const char* activeSensorLabel() {
   return strlen(g_cfg.sensor_label) > 0 ? g_cfg.sensor_label : g_sensorId;
 }
 
+bool isAbnormalReset() {
+  return strstr(g_bootResetReason, "Power On") == nullptr &&
+         strstr(g_bootResetReason, "External System") == nullptr;
+}
+
+// ============================================================================
+// Diagnostic Status Summary, HTTP Server (/status, /diag, /clear) & Serial CLI
+// ============================================================================
+void formatStatusSummary(char* buf, size_t bufSize) {
+  updateHeapStats();
+  snprintf(buf, bufSize,
+           "=== Korotych ESP8266 Diagnostics ===\n"
+           "fw_version: %s\n"
+           "sensor_id: %s\n"
+           "sensor_label: %s\n"
+           "uptime_sec: %lu\n"
+           "mains_220v: %s\n"
+           "wifi_status: %d (ip=%s, rssi=%d dBm, disc=%lu, last_disc_reason=%u)\n"
+           "heap_now: %u B (min_seen=%u B)\n"
+           "max_block_now: %u B (min_seen=%u B)\n"
+           "frag_now: %u%% (max_seen=%u%%)\n"
+           "reset_reason: %s\n"
+           "reset_info: %s\n"
+           "village: ok=%lu fail=%lu last_http=%d ssl_err='%s'\n"
+           "telegram: configured=%s ok=%lu fail=%lu last_http=%d ssl_err='%s'\n"
+           "endpoints: /status | /diag (download full log) | /clear\n",
+           FW_VERSION,
+           g_sensorId,
+           activeSensorLabel(),
+           static_cast<unsigned long>(millis() / 1000UL),
+           g_mainsState ? "ON" : "OFF",
+           static_cast<int>(WiFi.status()),
+           WiFi.localIP().toString().c_str(),
+           (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0,
+           static_cast<unsigned long>(g_wifiDiscCount),
+           static_cast<unsigned int>(g_lastWifiDiscReason),
+           ESP.getFreeHeap(),
+           (g_minFreeHeapSeen == 0xFFFFFFFFUL) ? ESP.getFreeHeap() : g_minFreeHeapSeen,
+           ESP.getMaxFreeBlockSize(),
+           (g_minMaxBlockSeen == 0xFFFFFFFFUL) ? ESP.getMaxFreeBlockSize() : g_minMaxBlockSeen,
+           ESP.getHeapFragmentation(),
+           g_maxFragSeen,
+           g_bootResetReason,
+           g_bootResetInfo,
+           static_cast<unsigned long>(g_villageOkCount),
+           static_cast<unsigned long>(g_villageFailCount),
+           g_lastVillageHttpCode,
+           g_lastVillageSslErr,
+           isTelegramConfigured() ? "yes" : "no",
+           static_cast<unsigned long>(g_tgOkCount),
+           static_cast<unsigned long>(g_tgFailCount),
+           g_lastTgHttpCode,
+           g_lastTgSslErr);
+}
+
+void streamFileToSerial(const char* path) {
+  if (!g_fsMounted || !LittleFS.exists(path)) return;
+  File f = LittleFS.open(path, "r");
+  if (!f) return;
+  char chunk[129];
+  while (f.available()) {
+    size_t n = f.readBytes(chunk, sizeof(chunk) - 1);
+    chunk[n] = '\0';
+    Serial.print(chunk);
+    yield();
+  }
+  f.close();
+}
+
+void dumpDiagnosticsToSerial() {
+  char summary[768];
+  formatStatusSummary(summary, sizeof(summary));
+  Serial.println(F("----- BEGIN ESP8266 DIAG DUMP -----"));
+  Serial.print(summary);
+  Serial.println(F("--- PERSISTED LOGS ---"));
+  streamFileToSerial(DIAG_PREV_PATH);
+  streamFileToSerial(DIAG_LOG_PATH);
+  Serial.println(F("----- END ESP8266 DIAG DUMP -----"));
+}
+
+void streamFileToHttp(const char* path) {
+  if (!g_fsMounted || !LittleFS.exists(path)) return;
+  File f = LittleFS.open(path, "r");
+  if (!f) return;
+  char chunk[257];
+  while (f.available()) {
+    size_t n = f.readBytes(chunk, sizeof(chunk) - 1);
+    chunk[n] = '\0';
+    g_diagServer.sendContent(chunk);
+    yield();
+  }
+  f.close();
+}
+
+void handleHttpStatus() {
+  char summary[768];
+  formatStatusSummary(summary, sizeof(summary));
+  g_diagServer.send(200, "text/plain; charset=utf-8", summary);
+}
+
+void handleHttpDiagDownload() {
+  char disp[64];
+  snprintf(disp, sizeof(disp), "attachment; filename=\"%s_diag.txt\"", g_sensorId);
+  g_diagServer.sendHeader("Content-Disposition", disp);
+  g_diagServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  g_diagServer.send(200, "text/plain; charset=utf-8", "");
+
+  char summary[768];
+  formatStatusSummary(summary, sizeof(summary));
+  g_diagServer.sendContent(summary);
+  g_diagServer.sendContent("\n--- PERSISTED LOGS ---\n");
+  streamFileToHttp(DIAG_PREV_PATH);
+  streamFileToHttp(DIAG_LOG_PATH);
+  g_diagServer.sendContent("");
+}
+
+void handleHttpClearLogs() {
+  if (g_fsMounted) {
+    LittleFS.remove(DIAG_PREV_PATH);
+    LittleFS.remove(DIAG_LOG_PATH);
+  }
+  diagLog("DIAG", "Logs cleared via HTTP");
+  g_diagServer.send(200, "text/plain; charset=utf-8", "OK: diagnostic logs cleared\n");
+}
+
+void startDiagServer() {
+  if (g_diagServerRunning) return;
+  g_diagServer.on("/", HTTP_GET, handleHttpStatus);
+  g_diagServer.on("/status", HTTP_GET, handleHttpStatus);
+  g_diagServer.on("/diag", HTTP_GET, handleHttpDiagDownload);
+  g_diagServer.on("/clear", HTTP_GET, handleHttpClearLogs);
+  g_diagServer.begin();
+  g_diagServerRunning = true;
+}
+
+void stopDiagServer() {
+  if (!g_diagServerRunning) return;
+  g_diagServer.stop();
+  g_diagServerRunning = false;
+  yield();
+}
+
+void handleSerialCommands() {
+  static char cmdBuf[24];
+  static size_t cmdLen = 0;
+
+  while (Serial.available()) {
+    char c = static_cast<char>(Serial.read());
+    if (c == '\r' || c == '\n') {
+      if (cmdLen > 0) {
+        cmdBuf[cmdLen] = '\0';
+        cmdLen = 0;
+        trimInPlace(cmdBuf);
+
+        if (strcasecmp(cmdBuf, "DUMP") == 0) {
+          dumpDiagnosticsToSerial();
+        } else if (strcasecmp(cmdBuf, "STATUS") == 0) {
+          char summary[768];
+          formatStatusSummary(summary, sizeof(summary));
+          Serial.print(summary);
+        } else if (strcasecmp(cmdBuf, "CLEAR") == 0) {
+          if (g_fsMounted) {
+            LittleFS.remove(DIAG_PREV_PATH);
+            LittleFS.remove(DIAG_LOG_PATH);
+          }
+          diagLog("DIAG", "Logs cleared via Serial");
+        } else if (strcasecmp(cmdBuf, "REBOOT") == 0) {
+          diagLog("SYS", "Manual reboot via Serial");
+          Serial.flush();
+          delay(150);
+          ESP.restart();
+        }
+      }
+    } else if (cmdLen < sizeof(cmdBuf) - 1) {
+      cmdBuf[cmdLen++] = c;
+    }
+  }
+}
+
+void flushWifiEvents() {
+  if (g_wifiDiscPending) {
+    g_wifiDiscPending = false;
+    diagLog("WIFI", "Disconnected reason=%u count=%lu",
+            static_cast<unsigned int>(g_lastWifiDiscReason),
+            static_cast<unsigned long>(g_wifiDiscCount));
+  }
+  if (g_wifiGotIpPending) {
+    g_wifiGotIpPending = false;
+    diagLog("WIFI", "GotIP=%s", WiFi.localIP().toString().c_str());
+  }
+}
+
 // ============================================================================
 // 50 Hz Mains Sampling (60 ms window = 3 full AC cycles)
 // ============================================================================
@@ -294,13 +581,22 @@ bool sampleMains50Hz() {
 // ============================================================================
 // LittleFS Config Storage
 // ============================================================================
-bool loadConfig() {
+bool mountFilesystem() {
+  if (g_fsMounted) return true;
   if (!LittleFS.begin()) {
     Serial.println(F("[FS] Mount failed, formatting..."));
     if (!LittleFS.format() || !LittleFS.begin()) {
       Serial.println(F("[FS] Format/mount failed"));
       return false;
     }
+  }
+  g_fsMounted = true;
+  return true;
+}
+
+bool loadConfig() {
+  if (!mountFilesystem()) {
+    return false;
   }
 
   if (!LittleFS.exists(CONFIG_PATH)) {
@@ -334,6 +630,8 @@ bool loadConfig() {
 }
 
 bool saveConfig() {
+  if (!mountFilesystem()) return false;
+
   JsonDocument doc;
   doc["sensor_label"] = g_cfg.sensor_label;
   doc["tg_bot_token"] = g_cfg.tg_bot_token;
@@ -364,6 +662,7 @@ void onSaveConfigCallback() {
 }
 
 void runConfigPortal(bool forcePortal) {
+  stopDiagServer();
   releaseTlsClient();
 
   // Temporarily allow SDK to persist newly entered Wi-Fi credentials to Flash
@@ -419,7 +718,7 @@ void runConfigPortal(bool forcePortal) {
 
   bool connected = false;
   if (forcePortal) {
-    Serial.println(F("[WiFi] Starting forced config portal..."));
+    diagLog("WIFI", "Starting forced config portal");
     connected = wm.startConfigPortal(AP_NAME);
   } else {
     Serial.println(F("[WiFi] Running autoConnect..."));
@@ -438,19 +737,16 @@ void runConfigPortal(bool forcePortal) {
   WiFi.setAutoReconnect(true);
 
   if (!connected) {
-    Serial.println(F("[WiFi] Portal timed out / not connected, rebooting..."));
+    diagLog("WIFI", "Portal timeout/not connected -> reboot");
     Serial.flush();
     delay(1500);
     ESP.restart();
   }
 
   g_lastVillageSuccessMs = millis();
+  startDiagServer();
 
-  Serial.printf("[WiFi] Connected! IP: %s, RSSI: %d dBm, heap=%u, frag=%u%%\n",
-                WiFi.localIP().toString().c_str(),
-                WiFi.RSSI(),
-                ESP.getFreeHeap(),
-                ESP.getHeapFragmentation());
+  diagLog("WIFI", "Connected IP=%s", WiFi.localIP().toString().c_str());
 }
 
 // ============================================================================
@@ -458,8 +754,10 @@ void runConfigPortal(bool forcePortal) {
 // ============================================================================
 bool sendToVillageBot(bool online) {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.printf("[Village] Skip send: WiFi disconnected (heap=%u, frag=%u%%)\n",
-                  ESP.getFreeHeap(), ESP.getHeapFragmentation());
+    g_villageFailCount++;
+    g_lastVillageHttpCode = -100;
+    strlcpy(g_lastVillageSslErr, "wifi_disconnected", sizeof(g_lastVillageSslErr));
+    diagLog("VLG", "Skip send: WiFi down");
     return false;
   }
 
@@ -470,8 +768,11 @@ bool sendToVillageBot(bool online) {
   http.setReuse(false);
 
   if (!http.begin(g_tlsClient, VILLAGE_URL)) {
-    Serial.println(F("[Village] http.begin failed"));
+    g_villageFailCount++;
+    g_lastVillageHttpCode = -101;
+    strlcpy(g_lastVillageSslErr, "http_begin_failed", sizeof(g_lastVillageSslErr));
     releaseTlsClient();
+    diagLog("VLG", "http.begin failed");
     return false;
   }
 
@@ -488,19 +789,25 @@ bool sendToVillageBot(bool online) {
   size_t len = serializeJson(doc, payload, sizeof(payload));
 
   int code = http.POST(reinterpret_cast<uint8_t*>(payload), len);
+  if (code <= 0) {
+    captureTlsError(g_lastVillageSslErr, sizeof(g_lastVillageSslErr));
+  } else {
+    g_lastVillageSslErr[0] = '\0';
+  }
   http.end();
   releaseTlsClient();
 
+  g_lastVillageHttpCode = code;
   bool ok = (code >= 200 && code < 300);
   if (ok) {
+    g_villageOkCount++;
     g_lastVillageSuccessMs = millis();
+    diagLog("VLG", "POST on=%d -> %d (ok=%lu)", online ? 1 : 0, code, static_cast<unsigned long>(g_villageOkCount));
+  } else {
+    g_villageFailCount++;
+    diagLog("VLG", "FAIL on=%d -> %d ssl='%s' (fail=%lu)",
+            online ? 1 : 0, code, g_lastVillageSslErr, static_cast<unsigned long>(g_villageFailCount));
   }
-
-  Serial.printf("[Village] POST online=%s -> HTTP %d (heap=%u, frag=%u%%)\n",
-                online ? "true" : "false",
-                code,
-                ESP.getFreeHeap(),
-                ESP.getHeapFragmentation());
   return ok;
 }
 
@@ -512,8 +819,10 @@ bool sendTelegramMessage(const char* htmlText) {
     return true;
   }
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.printf("[TG] Skip send: WiFi disconnected (heap=%u, frag=%u%%)\n",
-                  ESP.getFreeHeap(), ESP.getHeapFragmentation());
+    g_tgFailCount++;
+    g_lastTgHttpCode = -100;
+    strlcpy(g_lastTgSslErr, "wifi_disconnected", sizeof(g_lastTgSslErr));
+    diagLog("TG", "Skip send: WiFi down");
     return false;
   }
 
@@ -527,8 +836,11 @@ bool sendTelegramMessage(const char* htmlText) {
   http.setReuse(false);
 
   if (!http.begin(g_tlsClient, url)) {
-    Serial.println(F("[TG] http.begin failed"));
+    g_tgFailCount++;
+    g_lastTgHttpCode = -101;
+    strlcpy(g_lastTgSslErr, "http_begin_failed", sizeof(g_lastTgSslErr));
     releaseTlsClient();
+    diagLog("TG", "http.begin failed");
     return false;
   }
 
@@ -544,14 +856,23 @@ bool sendTelegramMessage(const char* htmlText) {
   size_t len = serializeJson(doc, payload, sizeof(payload));
 
   int code = http.POST(reinterpret_cast<uint8_t*>(payload), len);
+  if (code <= 0) {
+    captureTlsError(g_lastTgSslErr, sizeof(g_lastTgSslErr));
+  } else {
+    g_lastTgSslErr[0] = '\0';
+  }
   http.end();
   releaseTlsClient();
 
+  g_lastTgHttpCode = code;
   bool ok = (code >= 200 && code < 300);
-  Serial.printf("[TG] sendMessage -> HTTP %d (heap=%u, frag=%u%%)\n",
-                code,
-                ESP.getFreeHeap(),
-                ESP.getHeapFragmentation());
+  if (ok) {
+    g_tgOkCount++;
+    diagLog("TG", "sendMessage -> %d", code);
+  } else {
+    g_tgFailCount++;
+    diagLog("TG", "FAIL -> %d ssl='%s'", code, g_lastTgSslErr);
+  }
   return ok;
 }
 
@@ -561,18 +882,28 @@ void notifyPersonalBoot(bool online) {
   char escapedLabel[128];
   escapeHtmlToBuf(activeSensorLabel(), escapedLabel, sizeof(escapedLabel));
 
-  char msg[384];
+  char resetLine[128] = "";
+  if (isAbnormalReset()) {
+    char escReason[64];
+    escapeHtmlToBuf(g_bootResetReason, escReason, sizeof(escReason));
+    snprintf(resetLine, sizeof(resetLine), "\n⚠️ Причина рестарта: <code>%s</code>", escReason);
+  }
+
+  char msg[480];
   snprintf(msg, sizeof(msg),
            "🔌 <b>Датчик запущен</b>\n"
            "📍 Точка: <b>%s</b> (<code>%s</code>)\n"
            "⚡ Сеть 220 В: <b>%s</b>\n"
            "📶 Wi-Fi RSSI: %d dBm\n"
-           "📦 Прошивка: <code>v%s</code>",
+           "📦 Прошивка: <code>v%s</code>\n"
+           "🩺 Логи (в локальной сети): http://%s/diag%s",
            escapedLabel,
            g_sensorId,
            online ? "ЕСТЬ" : "НЕТ",
            WiFi.RSSI(),
-           FW_VERSION);
+           FW_VERSION,
+           WiFi.localIP().toString().c_str(),
+           resetLine);
 
   sendTelegramMessage(msg);
 }
@@ -611,19 +942,19 @@ void onOtaProgress(int cur, int total) {
 
 void checkAndApplyOta() {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println(F("[OTA] Skip: WiFi disconnected"));
+    diagLog("OTA", "Skip: WiFi down");
     return;
   }
 
+  stopDiagServer();
   releaseTlsClient();
 
   uint32_t freeHeap = ESP.getFreeHeap();
-  uint8_t frag = ESP.getHeapFragmentation();
-  Serial.printf("[OTA] Checking %s (current v%s, heap=%u, frag=%u%%)\n",
-                OTA_VERSION_URL, FW_VERSION, freeHeap, frag);
+  diagLog("OTA", "Check v%s", FW_VERSION);
 
   if (freeHeap < MIN_OTA_FREE_HEAP_BYTES) {
-    Serial.printf("[OTA] Skip: low heap (%u < %u)\n", freeHeap, MIN_OTA_FREE_HEAP_BYTES);
+    diagLog("OTA", "Skip: low heap (%u < %u)", freeHeap, MIN_OTA_FREE_HEAP_BYTES);
+    startDiagServer();
     return;
   }
 
@@ -635,17 +966,20 @@ void checkAndApplyOta() {
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 
   if (!http.begin(g_tlsClient, OTA_VERSION_URL)) {
-    Serial.println(F("[OTA] Version check http.begin failed"));
+    diagLog("OTA", "Version http.begin failed");
     releaseTlsClient();
+    startDiagServer();
     return;
   }
 
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
-    Serial.printf("[OTA] Version check HTTP %d (heap=%u, frag=%u%%)\n",
-                  code, ESP.getFreeHeap(), ESP.getHeapFragmentation());
+    char sslErr[64] = "";
+    if (code <= 0) captureTlsError(sslErr, sizeof(sslErr));
     http.end();
     releaseTlsClient();
+    diagLog("OTA", "Version HTTP %d ssl='%s'", code, sslErr);
+    startDiagServer();
     return;
   }
 
@@ -670,17 +1004,18 @@ void checkAndApplyOta() {
   trimInPlace(remoteVer);
 
   if (remoteVer[0] == '\0' || strlen(remoteVer) > 24 || strchr(remoteVer, '<') != nullptr) {
-    Serial.printf("[OTA] Invalid version response: '%s'\n", remoteVer);
+    diagLog("OTA", "Invalid version='%s'", remoteVer);
+    startDiagServer();
     return;
   }
 
   if (strcmp(remoteVer, FW_VERSION) == 0) {
-    Serial.printf("[OTA] Up to date (v%s, heap=%u, frag=%u%%)\n",
-                  FW_VERSION, ESP.getFreeHeap(), ESP.getHeapFragmentation());
+    diagLog("OTA", "Up to date (v%s)", FW_VERSION);
+    startDiagServer();
     return;
   }
 
-  Serial.printf("[OTA] New version found: v%s -> v%s\n", FW_VERSION, remoteVer);
+  diagLog("OTA", "New version v%s -> v%s", FW_VERSION, remoteVer);
 
   if (isTelegramConfigured()) {
     char escapedLabel[128];
@@ -701,7 +1036,8 @@ void checkAndApplyOta() {
 
   freeHeap = ESP.getFreeHeap();
   if (freeHeap < MIN_OTA_FREE_HEAP_BYTES) {
-    Serial.printf("[OTA] Abort download: low heap (%u < %u)\n", freeHeap, MIN_OTA_FREE_HEAP_BYTES);
+    diagLog("OTA", "Abort download: low heap (%u)", freeHeap);
+    startDiagServer();
     return;
   }
 
@@ -720,8 +1056,7 @@ void checkAndApplyOta() {
     char escapedErr[128];
     escapeHtmlToBuf(ESPhttpUpdate.getLastErrorString().c_str(), escapedErr, sizeof(escapedErr));
 
-    Serial.printf("[OTA] Update failed (%d): %s (heap=%u, frag=%u%%)\n",
-                  errCode, escapedErr, ESP.getFreeHeap(), ESP.getHeapFragmentation());
+    diagLog("OTA", "Update failed (%d): %s", errCode, escapedErr);
     setLed(g_mainsState);
 
     if (isTelegramConfigured()) {
@@ -733,21 +1068,22 @@ void checkAndApplyOta() {
       sendTelegramMessage(msg);
     }
   } else if (ret == HTTP_UPDATE_NO_UPDATES) {
-    Serial.println(F("[OTA] No updates"));
+    diagLog("OTA", "No updates");
     setLed(g_mainsState);
   }
+
+  startDiagServer();
 }
 
 // ============================================================================
 // Software Watchdog (Heap & Village Delivery Health)
 // ============================================================================
 void checkSystemHealth() {
+  updateHeapStats();
   uint32_t freeHeap = ESP.getFreeHeap();
-  uint8_t frag = ESP.getHeapFragmentation();
 
   if (freeHeap < MIN_FREE_HEAP_BYTES) {
-    Serial.printf("[WDT] Low heap (%u < %u, frag=%u%%) -> restarting...\n",
-                  freeHeap, MIN_FREE_HEAP_BYTES, frag);
+    diagLog("WDT", "Low heap (%u < %u) -> restart", freeHeap, MIN_FREE_HEAP_BYTES);
     Serial.flush();
     delay(200);
     ESP.restart();
@@ -756,8 +1092,7 @@ void checkSystemHealth() {
   if (WiFi.status() == WL_CONNECTED) {
     uint32_t sinceOk = (uint32_t)(millis() - g_lastVillageSuccessMs);
     if (sinceOk >= VILLAGE_STALE_RESTART_MS) {
-      Serial.printf("[WDT] No village OK for %lu ms while WiFi connected (heap=%u, frag=%u%%) -> restarting...\n",
-                    static_cast<unsigned long>(sinceOk), freeHeap, frag);
+      diagLog("WDT", "No village OK for %lu ms -> restart", static_cast<unsigned long>(sinceOk));
       Serial.flush();
       delay(200);
       ESP.restart();
@@ -779,7 +1114,7 @@ void handleResetButton() {
       Serial.println(F("[CFG] Reset button pressed..."));
     } else if ((uint32_t)(now - g_resetHoldStartMs) >= RESET_HOLD_MS) {
       g_resetHolding = false;
-      Serial.println(F("[CFG] 5s hold detected -> opening config portal"));
+      diagLog("CFG", "5s hold -> opening config portal");
       runConfigPortal(true);
       g_villagePendingSend = true;
     }
@@ -803,10 +1138,23 @@ void setup() {
   setLed(false);
 
   snprintf(g_sensorId, sizeof(g_sensorId), "esp_%06x", ESP.getChipId());
-  Serial.printf("[SYS] Sensor ID: %s (heap=%u, frag=%u%%)\n",
-                g_sensorId, ESP.getFreeHeap(), ESP.getHeapFragmentation());
+
+  strlcpy(g_bootResetReason, ESP.getResetReason().c_str(), sizeof(g_bootResetReason));
+  strlcpy(g_bootResetInfo, ESP.getResetInfo().c_str(), sizeof(g_bootResetInfo));
 
   loadConfig();
+  diagLog("BOOT", "v%s id=%s reason='%s' info='%s'",
+          FW_VERSION, g_sensorId, g_bootResetReason, g_bootResetInfo);
+
+  g_wifiDiscHandler = WiFi.onStationModeDisconnected([](const WiFiEventStationModeDisconnected& evt) {
+    g_lastWifiDiscReason = evt.reason;
+    g_wifiDiscCount++;
+    g_wifiDiscPending = true;
+  });
+  g_wifiGotIpHandler = WiFi.onStationModeGotIP([](const WiFiEventStationModeGotIP& evt) {
+    (void)evt;
+    g_wifiGotIpPending = true;
+  });
 
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
@@ -814,7 +1162,7 @@ void setup() {
 
   bool forcePortalOnBoot = (digitalRead(PIN_RESET_CFG) == RESET_ACTIVE_LEVEL);
   if (forcePortalOnBoot) {
-    Serial.println(F("[CFG] Reset pin held LOW at boot -> forcing config portal"));
+    diagLog("CFG", "Reset pin LOW at boot -> forcing portal");
   }
   runConfigPortal(forcePortalOnBoot);
 
@@ -824,7 +1172,7 @@ void setup() {
   g_candidateSinceMs = millis();
   setLed(g_mainsState);
 
-  Serial.printf("[MAINS] Initial state: %s\n", g_mainsState ? "220V ON" : "220V OFF");
+  diagLog("MAINS", "Initial=%s", g_mainsState ? "220V_ON" : "220V_OFF");
 
   // Initial notifications
   g_lastVillageSuccessMs = millis();
@@ -840,6 +1188,11 @@ void setup() {
 }
 
 void loop() {
+  handleSerialCommands();
+  flushWifiEvents();
+  if (g_diagServerRunning) {
+    g_diagServer.handleClient();
+  }
   handleResetButton();
   checkSystemHealth();
 
@@ -854,10 +1207,7 @@ void loop() {
              (uint32_t)(now - g_candidateSinceMs) >= DEBOUNCE_MS) {
     g_mainsState = g_candidateState;
     setLed(g_mainsState);
-    Serial.printf("[MAINS] Confirmed change -> %s (heap=%u, frag=%u%%)\n",
-                  g_mainsState ? "220V ON" : "220V OFF",
-                  ESP.getFreeHeap(),
-                  ESP.getHeapFragmentation());
+    diagLog("MAINS", "Change -> %s", g_mainsState ? "220V_ON" : "220V_OFF");
 
     g_villagePendingSend = true;
     notifyPersonalStatusChange(g_mainsState);
