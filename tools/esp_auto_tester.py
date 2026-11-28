@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Interactive Step-by-Step Automated Tester for Korotych ESP8266 Opto Sensor (v1.0.2+)
+Supports automatic report upload to @korotych_dev_bot via Telegram Bot API.
 
 Usage:
   pip install pyserial
@@ -11,12 +12,14 @@ Usage:
 
 import argparse
 import datetime
+import json
 import os
 import re
 import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 try:
     import serial
@@ -138,6 +141,97 @@ def evaluate_memory(heap: int, block: int, frag: int):
     return status, issues
 
 
+def load_telegram_config(cli_token=None, cli_chat_id=None):
+    token = (cli_token or "").strip()
+    chat_id = (cli_chat_id or "").strip()
+    bot_name = "@korotych_dev_bot"
+
+    secrets_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tester_secrets.json")
+    if os.path.isfile(secrets_path):
+        try:
+            with open(secrets_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not token:
+                token = str(data.get("tg_bot_token", "")).strip()
+            if not chat_id:
+                chat_id = str(data.get("tg_chat_id", "")).strip()
+            if data.get("bot_username"):
+                bot_name = str(data["bot_username"]).strip()
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"[WARN] Не удалось прочитать {secrets_path}: {exc}")
+
+    if not token:
+        token = os.environ.get("DEV_TG_BOT_TOKEN", "").strip()
+    if not chat_id:
+        chat_id = os.environ.get("DEV_TG_CHAT_ID", "").strip()
+
+    if token.startswith("REPLACE_") or len(token) < 20:
+        token = ""
+    if chat_id.startswith("REPLACE_") or len(chat_id) < 3:
+        chat_id = ""
+
+    return token, chat_id, bot_name
+
+
+def build_multipart_document(fields: dict, filename: str, file_bytes: bytes):
+    boundary = f"----EspTesterBoundary{uuid.uuid4().hex}"
+    chunks = []
+    for key, value in fields.items():
+        chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+        chunks.append(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode("utf-8"))
+        chunks.append(str(value).encode("utf-8"))
+        chunks.append(b"\r\n")
+
+    chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+    chunks.append(
+        f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n'
+        f"Content-Type: text/plain; charset=utf-8\r\n\r\n".encode("utf-8")
+    )
+    chunks.append(file_bytes)
+    chunks.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(chunks)
+    content_type = f"multipart/form-data; boundary={boundary}"
+    return content_type, body
+
+
+def upload_report_to_telegram(report_path: str, caption: str, token: str, chat_id: str, bot_name: str):
+    if not token or not chat_id:
+        print(
+            f"[INFO] Автоотправка в {bot_name} не настроена "
+            f"(создайте tools/tester_secrets.json из tester_secrets.json.example или задайте --tg-token / --tg-chat-id)."
+        )
+        return False
+
+    try:
+        with open(report_path, "rb") as f:
+            file_bytes = f.read()
+    except OSError as exc:
+        print(f"[WARN] Не удалось прочитать файл отчёта для отправки: {exc}")
+        return False
+
+    filename = os.path.basename(report_path)
+    content_type, body = build_multipart_document(
+        {"chat_id": chat_id, "caption": caption[:1000], "parse_mode": "HTML"},
+        filename,
+        file_bytes,
+    )
+    url = f"https://api.telegram.org/bot{token}/sendDocument"
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": content_type}, method="POST")
+
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            ok = 200 <= resp.status < 300
+            if ok:
+                print(f"[TG] Отчёт {filename} успешно отправлен в {bot_name} (chat_id={chat_id}).")
+                return True
+            print(f"[WARN] Telegram API вернул HTTP {resp.status}")
+            return False
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        safe_err = str(exc).replace(token, "***")
+        print(f"[WARN] Не удалось отправить отчёт в {bot_name}: {safe_err}")
+        return False
+
+
 def select_serial_port(preferred_port=None):
     if serial is None:
         print("ОШИБКА: не установлена библиотека pyserial. Выполните: pip install pyserial", file=sys.stderr)
@@ -178,6 +272,7 @@ class EspTester:
         self.results = []
         self.raw_transcript = []
         self.heap_samples = []
+        self.last_status = {}
 
     def open(self):
         self.ser = serial.Serial(self.port, self.baud, timeout=0.25)
@@ -223,7 +318,10 @@ class EspTester:
                 lines.append(line)
                 if line.startswith("endpoints:"):
                     break
-        return parse_status_block("\n".join(lines))
+        parsed = parse_status_block("\n".join(lines))
+        if parsed:
+            self.last_status = parsed
+        return parsed
 
     def query_dump(self, timeout_sec: float = 12.0) -> str:
         self.ser.reset_input_buffer()
@@ -241,7 +339,6 @@ class EspTester:
         return "\n".join(lines)
 
     def wait_for_mains_change(self, target_state: str, timeout_sec: float = 35.0):
-        """Wait for '[MAINS] Change -> 220V_ON/OFF' and collect follow-up VLG/TG responses."""
         expected = f"Change -> {target_state}"
         deadline = time.time() + timeout_sec
         mains_seen = False
@@ -300,7 +397,7 @@ class EspTester:
                 "FAIL",
                 "Плата не ответила на STATUS. Проверьте прошивку v1.0.2+, скорость 115200 и не открыт ли Serial Monitor.",
             )
-            return status
+            return status, ""
 
         print(
             f"    Прошивка: v{status.get('fw_version')} | ID: {status.get('sensor_id')} | "
@@ -459,6 +556,31 @@ class EspTester:
             f.write("\n")
         return os.path.abspath(path)
 
+    def build_telegram_caption(self) -> str:
+        fails = sum(1 for _, st, _ in self.results if st == "FAIL")
+        warns = sum(1 for _, st, _ in self.results if st == "WARN")
+        if fails == 0 and warns == 0:
+            verdict = "✅ <b>PASS</b>"
+        elif fails == 0:
+            verdict = f"⚠️ <b>WARN ({warns})</b>"
+        else:
+            verdict = f"❌ <b>FAIL ({fails}) / WARN ({warns})</b>"
+
+        st = self.last_status or {}
+        sensor_id = st.get("sensor_id", "unknown")
+        fw = st.get("fw_version", "?")
+        heap = st.get("heap_now", "?")
+        blk = st.get("block_now", "?")
+        frag = st.get("frag_now", "?")
+        reason = st.get("reset_reason", "?")
+        return (
+            f"🧪 <b>Отчёт автотеста ESP8266</b>\n"
+            f"Итог: {verdict}\n"
+            f"Плата: <code>{sensor_id}</code> · <code>v{fw}</code>\n"
+            f"Память: <code>h={heap} b={blk} f={frag}%</code>\n"
+            f"Рестарт: <code>{reason}</code>"
+        )
+
 
 def run_self_test():
     sample_status = """=== Korotych ESP8266 Diagnostics ===
@@ -493,7 +615,11 @@ endpoints: /status | /diag (download full log) | /clear
     log_parsed = parse_diag_line("[145][MAINS] Change -> 220V_ON | h=35120 b=30400 f=8% rssi=-55")
     assert log_parsed and log_parsed["tag"] == "MAINS" and log_parsed["heap"] == 35120, log_parsed
 
-    print("[SELF-TEST] PASS: status parser, diagLog parser, and memory evaluator verified.")
+    ct, body = build_multipart_document({"chat_id": "12345", "caption": "test"}, "report.txt", b"hello-log")
+    assert ct.startswith("multipart/form-data; boundary="), ct
+    assert b'filename="report.txt"' in body and b"hello-log" in body, body
+
+    print("[SELF-TEST] PASS: parsers, memory evaluator, and Telegram multipart uploader verified.")
 
 
 def main():
@@ -501,6 +627,9 @@ def main():
     parser.add_argument("--port", help="Serial port (e.g. COM3). Auto-detected if omitted.")
     parser.add_argument("--baud", type=int, default=115200, help="Serial baud rate (default: 115200)")
     parser.add_argument("--cycles", type=int, default=3, help="Number of D5 toggles for Step 6 stress test (default: 3)")
+    parser.add_argument("--tg-token", help="Telegram bot token for @korotych_dev_bot (overrides tester_secrets.json)")
+    parser.add_argument("--tg-chat-id", help="Target Telegram chat_id for report delivery")
+    parser.add_argument("--no-upload", action="store_true", help="Skip automatic Telegram report upload")
     parser.add_argument("--self-test", action="store_true", help="Run built-in unit self-test without hardware")
     args = parser.parse_args()
 
@@ -513,9 +642,7 @@ def main():
     dump_text = ""
     try:
         tester.open()
-        out = tester.run_all(stress_cycles=args.cycles)
-        if isinstance(out, tuple):
-            _, dump_text = out
+        _, dump_text = tester.run_all(stress_cycles=args.cycles)
     except KeyboardInterrupt:
         print("\n[INFO] Тест прерван пользователем (Ctrl+C).")
     finally:
@@ -533,7 +660,11 @@ def main():
     else:
         print(f"  ИТОГ: НАЙДЕНЫ ОШИБКИ (FAIL={fails}, WARN={warns})")
     print(f"  Файл отчёта: {report_path}")
-    print("  Передайте этот .txt файл разработчику для разбора.")
+
+    if not args.no_upload:
+        tg_token, tg_chat_id, bot_name = load_telegram_config(args.tg_token, args.tg_chat_id)
+        caption = tester.build_telegram_caption()
+        upload_report_to_telegram(report_path, caption, tg_token, tg_chat_id, bot_name)
     print("============================================================")
 
 

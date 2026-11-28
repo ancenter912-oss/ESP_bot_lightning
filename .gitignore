@@ -1,6 +1,7 @@
 # Local secrets & environment
 secrets.h
 esp8266/korotych_esp8266_opto/secrets.h
+tools/tester_secrets.json
 .env
 .env.*
 .agents/
